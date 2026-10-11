@@ -15,4 +15,161 @@ bin-release/
 
 # Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
 # should NOT be excluded as they contain compiler settings and other important
-# information for Eclipse / Flash Builder.
+# information for Eclips# ═══════════════════════════════════════════════════════════════════════════# NEXUS SILICON STUDIO — .gitignore
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ─── Python ───
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ─── Environnements virtuels ───
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ─── RTL / Simulateurs ───
+*.vcd
+*.vvp
+*.fst
+*.lxt
+*.lxt2
+*.ghw
+sim
+sim.vvp
+synth/
+*.blif
+*.edif
+*.json.gz
+
+# ─── Build artefacts ───
+*.o
+*.a
+*.lib
+*.obj
+*.exe
+*.dll
+*.dylib
+*.out
+
+# ─── IDE / Éditeurs ───
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+.project
+.classpath
+.settings/
+
+# ─── OS ───
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ─── Logs / Cache ───
+*.log
+logs/
+cache/
+.cache/
+studio.log
+*.pid
+*.lock
+
+# ─── Données générées ───
+projects/
+nexus_silicon/
+*.db
+*.sqlite
+*.sqlite3
+
+# ─── Secrets / Credentials ───
+.env
+.env.local
+.env.*.local
+secrets/
+*.pem
+*.key
+*.crt
+*.p12
+config.local.json
+
+# ─── Temporaires ───
+tmp/
+temp/
+*.tmp
+*.bak
+*.old
+*.orig
+
+# ─── Fichiers de mesures/reports ───
+reports/
+results/
+*.csv
+*.tsv
+*.xlsx
+*.pdf
+
+# ─── Fichiers de studio ───
+.wt
+studio_data/
+
+
+
+# ⚡ NEXUS SILICON STUDIO
+<p align="center">
+<img src="https://img.shields.io/badge/version-3.0.0-c8a45c?style=for-the-badge&labelColor=0d1117" />
+<img src="https://img.shields.io/badge/python-3.8%2B-00d4ff?style=for-the-badge&labelColor=0d1117" />
+<img src="https://img.shields.io/badge/verilog-synthétisable-4ade80?style=for-the-badge&labelColor=0d1117" />
+<img src="https://img.shields.io/badge/license-NEXUS--OPEN--3.0-ff6ec7?style=for-the-badge&labelColor=0d1117" />
+<img src="https://img.shields.io/badge/dependencies-ZERO-9d4edd?style=for-the-badge&labelColor=0d1117" />
+</p>
+
+<p align="center">
+<b>Vrai calculateur d'architecture silicium · Générateur RTL Verilog · Web Dashboard</b><br>
+<i>Conçu par Aissa Mohammedi (DGK) — Port 9982</i>
+</p>
+
+---
+
+## 🌟 Vue d'ensemble
+
+**NEXUS SILICON STUDIO** est un studio complet d'exploration d'architectures HPC accélérateurs IA. Il combine :
+
+- **Un calculateur physique** basé sur des formules réelles (P = αCV²f, Yield binomial, Roofline, thermique)
+- **Un générateur RTL Verilog-2001 synthétisable** (testé avec iverilog et yosys)
+- **Un dashboard web interactif** (port 9982)
+- **Zéro dépendance externe** (Python stdlib uniquement)
+
+Contrairement aux simulateurs "boîte noire", **chaque chiffre est justifié par une formule nommée**, une source, et une unité.
+
+---e / Flash Builder.
