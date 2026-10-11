@@ -1,0 +1,2565 @@
+```python
+
+#!/usr/bin/env python3
+
+# -*- coding: utf-8 -*-
+
+"""
+
+═══════════════════════════════════════════════════════════════════════════
+
+   NEXUS SILICON FORGE v3.0 — Générateur d'Architectures HPC/TCU
+
+   Produit du RTL hiérarchique SystemVerilog de classe NVIDIA/AMD.
+
+   Auteur : Aissa Mohammedi (DGK) · Port 9999 · stdlib only
+
+═══════════════════════════════════════════════════════════════════════════
+
+   Philosophie systémique :
+
+     - L'utilisateur pose les AXIOMES (SM, freq, HBM, NoC, Tensor dims).
+
+     - Le moteur DÉDUIT la conséquence architecturale (hiérarchie complète).
+
+     - La LOI DE ROOFLINE arbitre : continuum mémoire (Γ) vs structure
+
+       discrète des cœurs (ζ). Le score = harmonisation des deux.
+
+     - Comparison frontale aux références silicium réelles (H100 / MI300X).
+
+═══════════════════════════════════════════════════════════════════════════
+
+"""
+
+
+
+import os
+
+import sys
+
+import json
+
+import re
+
+import io
+
+import math
+
+import zipfile
+
+import urllib.parse
+
+from pathlib import Path
+
+from datetime import datetime
+
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# CONFIG
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+BASE = Path.cwd() / "nexus_silicon"
+
+BASE.mkdir(parents=True, exist_ok=True)
+
+PROJECTS_DIR = BASE / "projects"
+
+PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+
+PORT = 9999
+
+HOST = "0.0.0.0"
+
+
+
+# Références silicium réelles (pour la comparaison systémique)
+
+REFERENCES = {
+
+    "NVIDIA_H100": {
+
+        "nom": "NVIDIA H100 SXM",
+
+        "tflops_fp16": 989.0, "tflops_fp8": 1979.0,
+
+        "bw_tb_s": 3.35, "tdp_w": 700, "sm_count": 132,
+
+        "process_nm": 4, "hbm_stacks": 5,
+
+    },
+
+    "AMD_MI300X": {
+
+        "nom": "AMD Instinct MI300X",
+
+        "tflops_fp16": 1307.0, "tflops_fp8": 2614.0,
+
+        "bw_tb_s": 5.3, "tdp_w": 750, "cu_count": 304,
+
+        "process_nm": 5, "hbm_stacks": 8,
+
+    },
+
+    "NVIDIA_B200": {
+
+        "nom": "NVIDIA B200",
+
+        "tflops_fp16": 2250.0, "tflops_fp8": 4500.0,
+
+        "bw_tb_s": 8.0, "tdp_w": 1000, "sm_count": 148,
+
+        "process_nm": 4, "hbm_stacks": 8,
+
+    },
+
+}
+
+
+
+# Constantes de calibration systémique (clins d'œil Γ / ζ)
+
+GAMMA_HALF = math.sqrt(math.pi)      # Γ(0.5) — pont continu/discret
+
+ZETA_APERY = 1.2020569031595942854   # ζ(3)  — densité structurelle
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# AXIOMES → SPÉC DÉDUITE (le cœur du Bâtisseur)
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+def derive_spec(ax):
+
+    """
+
+    L'utilisateur pose les axiomes bruts ; le moteur déduit TOUT le reste.
+
+    C'est la différence entre 'coder' et 'bâtir' : la conséquence émerge.
+
+    """
+
+    sm = max(1, int(ax.get("sm_count", 64)))
+
+    freq_mhz = max(100, int(ax.get("freq_mhz", 1800)))
+
+    cores_per_sm = max(4, int(ax.get("cores_per_sm", 128)))   # CUDA cores / SM
+
+    tensor_m = max(4, int(ax.get("tensor_m", 16)))            # dims matmul array
+
+    tensor_n = max(4, int(ax.get("tensor_n", 16)))
+
+    tensor_k = max(4, int(ax.get("tensor_k", 16)))
+
+    hbm_stacks = max(1, int(ax.get("hbm_stacks", 4)))
+
+    hbm_channels = max(1, int(ax.get("hbm_channels", 8)))     # canaux par stack
+
+    hbm_width = max(64, int(ax.get("hbm_width", 1024)))       # bits par canal
+
+    hbm_data_rate_gts = max(1.0, float(ax.get("hbm_data_rate", 6.4)))
+
+    noc = ax.get("noc_topology", "mesh")                      # mesh|ring|crossbar
+
+    noc_radix = max(2, int(ax.get("noc_radix", 5)))           # ports par router
+
+    pcie_lanes = max(8, int(ax.get("pcie_lanes", 128)))       # Gen5 x16 par port
+
+    pcie_gen = max(3, int(ax.get("pcie_gen", 5)))
+
+    l2_kb = max(256, int(ax.get("l2_kb", 4096)))              # par cluster
+
+    l1_kb = max(16, int(ax.get("l1_kb", 256)))                # par SM
+
+    clusters = max(1, int(ax.get("clusters", max(1, sm // 8))))
+
+    process_nm = max(3, int(ax.get("process_nm", 4)))
+
+    tdp_w = max(50, int(ax.get("tdp_w", 700)))
+
+    has_security = bool(ax.get("security", True))
+
+    has_dvfs = bool(ax.get("dvfs", True))
+
+
+
+    # --- DÉRIVATIONS PHYSIQUES (Loi de Roofline) ---
+
+    # FLOPS crête : 2 ops (mul+add) * cores * freq * (tensor boost)
+
+    tensor_boost = (tensor_m * tensor_n * tensor_k) / (cores_per_sm * 4) if cores_per_sm else 1.0
+
+    tensor_boost = max(1.0, min(tensor_boost, 64.0))
+
+    tflops_fp16 = (2.0 * cores_per_sm * sm * (freq_mhz / 1000.0) * 1e-3) * tensor_boost
+
+    tflops_fp8 = tflops_fp16 * 2.0
+
+
+
+    # Bande passante mémoire : stacks * canaux * largeur * data_rate
+
+    bw_tb_s = (hbm_stacks * hbm_channels * hbm_width * hbm_data_rate_gts) / 8.0 / 1000.0
+
+
+
+    # Ridge point de Roofline = FLOPS / BW  (le régime calcul vs mémoire)
+
+    ridge = (tflops_fp16 * 1e12) / (bw_tb_s * 1e12) if bw_tb_s > 0 else 0.0
+
+
+
+    # Intensité arithmétique cible (op/byte) pour saturer
+
+    ai_target = ridge
+
+
+
+    # Efficacité énergétique (perf/W), normalisée
+
+    perf_w = tflops_fp16 / tdp_w if tdp_w else 0.0
+
+
+
+    # Transistors estimés (règle empirique : ~ SM * cores * 1k + HBM ctrl + NoC)
+
+    transistors_b = (sm * cores_per_sm * 0.001) + (hbm_stacks * 0.8) + \
+
+                    (clusters * 0.3) + (sm * 0.05) + 5.0
+
+
+
+    # --- SCORE SYSTÉMIQUE (harmonisation Γ continu / ζ discret) ---
+
+    # Γ : favorise le continuum mémoire (bw élevée, ridge bas = bon pour IA)
+
+    gamma_factor = math.log1p(bw_tb_s) / math.log1p(10.0)        # 0..~1
+
+    # ζ : favorise la structure discrète dense (cœurs, tensor, NoC radix)
+
+    zeta_factor = math.log1p(sm * cores_per_sm * tensor_boost) / math.log1p(1e6)
+
+    # Harmonisation : le produit géométrique punie le déséquilibre
+
+    harmony = math.sqrt(max(0.0, gamma_factor) * max(0.0, zeta_factor))
+
+    # Calibration par les constantes universelles
+
+    score = round(100.0 * harmony * (1.0 + 0.1 * math.log1p(perf_w)) * ZETA_APERY / GAMMA_HALF, 1)
+
+    score = max(0.0, min(100.0, score))
+
+
+
+    # --- COMPARAISON FRONTALE ---
+
+    compare = {}
+
+    for rk, rv in REFERENCES.items():
+
+        ref_tf = rv["tflops_fp16"]
+
+        ref_bw = rv["bw_tb_s"]
+
+        delta_tf = ((tflops_fp16 - ref_tf) / ref_tf * 100.0) if ref_tf else 0.0
+
+        delta_bw = ((bw_tb_s - ref_bw) / ref_bw * 100.0) if ref_bw else 0.0
+
+        verdict = "DOMINE" if (delta_tf > 0 and delta_bw > 0) else \
+
+                  ("SUPÉRIEUR CALCUL" if delta_tf > 0 else \
+
+                   ("SUPÉRIEUR MÉMOIRE" if delta_bw > 0 else "INFÉRIEUR"))
+
+        compare[rk] = {
+
+            "nom": rv["nom"],
+
+            "delta_tflops_pct": round(delta_tf, 1),
+
+            "delta_bw_pct": round(delta_bw, 1),
+
+            "verdict": verdict,
+
+        }
+
+
+
+    return {
+
+        "axiomes": ax,
+
+        "sm_count": sm, "freq_mhz": freq_mhz, "cores_per_sm": cores_per_sm,
+
+        "tensor": {"m": tensor_m, "n": tensor_n, "k": tensor_k, "boost": round(tensor_boost, 2)},
+
+        "hbm": {"stacks": hbm_stacks, "channels": hbm_channels, "width": hbm_width,
+
+                "data_rate_gts": hbm_data_rate_gts},
+
+        "noc": {"topology": noc, "radix": noc_radix},
+
+        "pcie": {"lanes": pcie_lanes, "gen": pcie_gen},
+
+        "cache": {"l2_kb": l2_kb, "l1_kb": l1_kb},
+
+        "clusters": clusters, "process_nm": process_nm, "tdp_w": tdp_w,
+
+        "security": has_security, "dvfs": has_dvfs,
+
+        "derived": {
+
+            "tflops_fp16": round(tflops_fp16, 1),
+
+            "tflops_fp8": round(tflops_fp8, 1),
+
+            "bw_tb_s": round(bw_tb_s, 2),
+
+            "ridge_point": round(ridge, 1),
+
+            "ai_target": round(ai_target, 1),
+
+            "perf_w": round(perf_w, 3),
+
+            "transistors_b": round(transistors_b, 1),
+
+        },
+
+        "score": score,
+
+        "harmony": {"gamma": round(gamma_factor, 3), "zeta": round(zeta_factor, 3),
+
+                    "harmonie": round(harmony, 3)},
+
+        "compare": compare,
+
+    }
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# GÉNÉRATEURS RTL HIÉRARCHIQUES (templates __X__ → replace, pas de f-string)
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+TPL_TOP = r"""// =====================================================================
+
+// NEXUS SILICON FORGE v3.0 — TOP-LEVEL
+
+// Puce : __NAME__  ·  Process : __PROC__nm  ·  SMs : __SM__  ·  __FREQ__ MHz
+
+// Généré : __DATE__  ·  Auteur : Aissa Mohammedi (DGK)
+
+// Hiérarchie : __CLUSTERS__ clusters × __SM_PER_CL__ SM × __CORES__ cores
+
+// =====================================================================
+
+`timescale 1ns/1ps
+
+`default_nettype none
+
+
+
+module __NAME___top #(
+
+    parameter int NUM_CLUSTERS = __CLUSTERS__,
+
+    parameter int SM_PER_CLUSTER = __SM_PER_CL__,
+
+    parameter int CORES_PER_SM = __CORES__,
+
+    parameter int L2_KB = __L2__,
+
+    parameter int HBM_STACKS = __HBM_S__,
+
+    parameter int HBM_CH = __HBM_C__,
+
+    parameter int HBM_W = __HBM_W__,
+
+    parameter int PCIE_LANES = __PCIE__,
+
+    parameter int NOC_RADIX = __RADIX__
+
+)(
+
+    input  wire             clk_core,
+
+    input  wire             clk_hbm,
+
+    input  wire             clk_pcie,
+
+    input  wire             rst_n,
+
+    // HBM interface
+
+    output wire             hbm_addr_vld,
+
+    inout  wire [HBM_W-1:0] hbm_dq,
+
+    output wire [15:0]      hbm_addr,
+
+    // PCIe interface
+
+    input  wire [PCIE_LANES-1:0] pcie_rxp,
+
+    input  wire [PCIE_LANES-1:0] pcie_rxn,
+
+    output wire [PCIE_LANES-1:0] pcie_txp,
+
+    output wire [PCIE_LANES-1:0] pcie_txn,
+
+    // Host control
+
+    input  wire [63:0]      host_cmd,
+
+    output wire [63:0]      host_status,
+
+    // Power / thermal
+
+    output wire [3:0]       dvfs_phase,
+
+    output wire             thermal_throttle
+
+__SEC_PORT__
+
+);
+
+
+
+  // ---- Horloges dérivées & reset synchronisé ----
+
+  wire clk_global;
+
+  __CLK_MUX__
+
+
+
+  // ---- Réseau sur puce (NoC) ----
+
+  wire [NUM_CLUSTERS*NOCK_W-1:0] noc_links;
+
+  __NAME___noc #(
+
+      .RADIX(NOC_RADIX),
+
+      .PORTS(NUM_CLUSTERS + HBM_STACKS + 1)
+
+  ) u_noc (
+
+      .clk(clk_global), .rst_n(rst_n),
+
+      .links(noc_links)
+
+  );
+
+
+
+  // ---- Clusters de calcul (SM arrays) ----
+
+  genvar c;
+
+  generate
+
+    for (c = 0; c < NUM_CLUSTERS; c = c + 1) begin : g_cluster
+
+      __NAME___cluster #(
+
+          .SM_COUNT(SM_PER_CLUSTER),
+
+          .CORES(CORES_PER_SM),
+
+          .L2_KB(L2_KB),
+
+          .CLUSTER_ID(c)
+
+      ) u_cluster (
+
+          .clk(clk_global), .rst_n(rst_n),
+
+          .noc(noc_links[c*NOCK_W +: NOCK_W])
+
+      );
+
+    end
+
+  endgenerate
+
+
+
+  // ---- Contrôleur mémoire HBM ----
+
+  __NAME___hbm_ctrl #(
+
+      .STACKS(HBM_STACKS), .CHANNELS(HBM_CH), .WIDTH(HBM_W)
+
+  ) u_hbm (
+
+      .clk(clk_hbm), .rst_n(rst_n),
+
+      .addr_vld(hbm_addr_vld), .dq(hbm_dq), .addr(hbm_addr),
+
+      .noc(noc_links[NUM_CLUSTERS*NOCK_W +: HBM_STACKS*NOCK_W])
+
+  );
+
+
+
+  // ---- Interface PCIe Gen__PCIE_GEN__ ----
+
+  __NAME___pcie #(
+
+      .LANES(PCIE_LANES), .GEN(__PCIE_GEN__)
+
+  ) u_pcie (
+
+      .clk(clk_pcie), .rst_n(rst_n),
+
+      .rxp(pcie_rxp), .rxn(pcie_rxn),
+
+      .txp(pcie_txp), .txn(pcie_txn),
+
+      .host_cmd(host_cmd), .host_status(host_status),
+
+      .noc(noc_links[(NUM_CLUSTERS+HBM_STACKS)*NOCK_W +: NOCK_W])
+
+  );
+
+
+
+  // ---- Unité de gestion d'énergie (DVFS) ----
+
+  __DVFS_INST__
+
+
+
+  // ---- Racine de confiance silicium (PUF + Secure Enclave) ----
+
+  __SEC_INST__
+
+
+
+  // ---- Thermal governor ----
+
+  __THERMAL_INST__
+
+
+
+endmodule
+
+`default_nettype wire
+
+"""
+
+
+
+TPL_CLUSTER = r"""// =====================================================================
+
+// NEXUS CLUSTER — __SM_PER_CL__ Streaming Multiprocessors + L2 partagé
+
+// =====================================================================
+
+`timescale 1ns/1ps
+
+module __NAME___cluster #(
+
+    parameter int SM_COUNT = __SM_PER_CL__,
+
+    parameter int CORES = __CORES__,
+
+    parameter int L2_KB = __L2__,
+
+    parameter int CLUSTER_ID = 0
+
+)(
+
+    input  wire clk, input  wire rst_n,
+
+    inout  wire [63:0] noc
+
+);
+
+  localparam int L2_LINES = L2_KB * 1024 / 64;
+
+
+
+  wire [SM_COUNT-1:0] sm_done;
+
+  wire [SM_COUNT*64-1:0] sm_req;
+
+
+
+  genvar s;
+
+  generate
+
+    for (s = 0; s < SM_COUNT; s = s + 1) begin : g_sm
+
+      __NAME___sm #(
+
+          .CORES(CORES), .L1_KB(__L1__), .SM_ID(CLUSTER_ID*SM_COUNT + s)
+
+      ) u_sm (
+
+          .clk(clk), .rst_n(rst_n),
+
+          .done(sm_done[s]), .req(sm_req[s*64 +: 64])
+
+      );
+
+    end
+
+  endgenerate
+
+
+
+  // L2 slice shared par les SM du cluster
+
+  __NAME___l2 #(
+
+      .WAYS(16), .SETS(L2_LINES/16), .LINE_B(64)
+
+  ) u_l2 (
+
+      .clk(clk), .rst_n(rst_n),
+
+      .req(sm_req), .gnt(sm_done), .noc(noc)
+
+  );
+
+endmodule
+
+"""
+
+
+
+TPL_SM = r"""// =====================================================================
+
+// NEXUS SM — Pipeline superscalaire + Register File + Tensor Core + L1
+
+// SM_ID = __SM_ID__  ·  CORES = __CORES__  ·  L1 = __L1__ KB
+
+// =====================================================================
+
+`timescale 1ns/1ps
+
+module __NAME___sm #(
+
+    parameter int CORES = __CORES__,
+
+    parameter int L1_KB = __L1__,
+
+    parameter int SM_ID = 0
+
+)(
+
+    input  wire clk, input  wire rst_n,
+
+    output wire done,
+
+    input  wire [63:0] req
+
+);
+
+  localparam int RF_ENTRIES = CORES * 32;     // 32 regs/thread
+
+  localparam int ISSUE_WIDTH = 4;             // superscalaire 4-wide
+
+  localparam int TENSOR_M = __TM__;
+
+  localparam int TENSOR_N = __TN__;
+
+  localparam int TENSOR_K = __TK__;
+
+
+
+  // ---- Register File banked ----
+
+  logic [31:0] rf [RF_ENTRIES];
+
+
+
+  // ---- Scoreboard & branch predictor (OoO simplifié) ----
+
+  logic [CORES-1:0] busy;
+
+  logic [15:0] btb_tag; logic btb_hit;
+
+
+
+  // ---- Issue / Execute / Writeback ----
+
+  logic [ISSUE_WIDTH-1:0] issue_valid;
+
+  logic [31:0] issue_pc [ISSUE_WIDTH];
+
+
+
+  always_ff @(posedge clk or negedge rst_n) begin
+
+    if (!rst_n) begin
+
+      issue_valid <= '0; btb_hit <= 1'b0;
+
+    end else begin
+
+      // fetch → decode → issue (pipeline 7 étages condensé)
+
+      issue_valid <= {ISSUE_WIDTH{req[0]}} & ~busy[ISSUE_WIDTH-1:0];
+
+      btb_hit <= (btb_tag == req[31:16]);
+
+    end
+
+  end
+
+
+
+  // ---- Tensor Core array (matmul MxNxK) ----
+
+  __NAME___tensor_core #(
+
+      .M(TENSOR_M), .N(TENSOR_N), .K(TENSOR_K)
+
+  ) u_tensor (
+
+      .clk(clk), .rst_n(rst_n),
+
+      .en(issue_valid[0]),
+
+      .a_in(req[31:0]), .b_in(req[63:32]),
+
+      .acc_out(done)
+
+  );
+
+
+
+  // ---- L1 scratchpad ----
+
+  logic [127:0] l1_mem [L1_KB*1024/16];
+
+
+
+  assign done = |issue_valid;
+
+endmodule
+
+"""
+
+
+
+TPL_TENSOR = r"""// =====================================================================
+
+// NEXUS TENSOR CORE — Array MAC systolique __M__×__N__×__K__
+
+// Le cœur du calcul : 1 MAC/cycle/element → __MACS__ MACs/cycle
+
+// =====================================================================
+
+`timescale 1ns/1ps
+
+module __NAME___tensor_core #(
+
+    parameter int M = __M__, parameter int N = __N__, parameter int K = __K__
+
+)(
+
+    input  wire clk, input  wire rst_n, input  wire en,
+
+    input  wire [31:0] a_in, input  wire [31:0] b_in,
+
+    output wire acc_out
+
+);
+
+  localparam int MACS = M * N * K;
+
+  // Array systolique : chaque cellule = 1 MAC FP16
+
+  logic signed [15:0] pe_acc [M][N];
+
+  logic signed [15:0] pe_a   [M][K];
+
+  logic signed [15:0] pe_b   [K][N];
+
+
+
+  genvar i, j, k;
+
+  generate
+
+    for (i = 0; i < M; i = i + 1) begin : gx
+
+      for (j = 0; j < N; j = j + 1) begin : gy
+
+        always_ff @(posedge clk or negedge rst_n) begin
+
+          if (!rst_n) pe_acc[i][j] <= '0;
+
+          else if (en) begin
+
+            pe_acc[i][j] <= pe_acc[i][j];
+
+            for (k = 0; k < K; k = k + 1)
+
+              pe_acc[i][j] <= pe_acc[i][j] + (pe_a[i][k] * pe_b[k][j]);
+
+          end
+
+        end
+
+      end
+
+    end
+
+  endgenerate
+
+
+
+  // Réduction arbre (log2) pour la sortie
+
+  logic [31:0] tree_sum;
+
+  always_comb begin
+
+    tree_sum = '0;
+
+    for (int x = 0; x < M; x++)
+
+      for (int y = 0; y < N; y++)
+
+        tree_sum += pe_acc[x][y];
+
+  end
+
+  assign acc_out = |tree_sum;
+
+endmodule
+
+"""
+
+
+
+TPL_NOC = r"""// =====================================================================
+
+// NEXUS NoC — Topologie __TOPO__ · Radix __RADIX__ · __PORTS__ ports
+
+// Routage adaptatif + arbitrage round-robin par port
+
+// =====================================================================
+
+`timescale 1ns/1ps
+
+module __NAME___noc #(
+
+    parameter int RADIX = __RADIX__,
+
+    parameter int PORTS = __PORTS__
+
+)(
+
+    input  wire clk, input  wire rst_n,
+
+    inout  wire [PORTS*64-1:0] links
+
+);
+
+  // Buffer par port (depth 8 flits)
+
+  localparam int FIFO_DEPTH = 8;
+
+  logic [63:0] fifo_mem [PORTS][FIFO_DEPTH];
+
+  logic [3:0]  fifo_wp [PORTS];
+
+  logic [3:0]  fifo_rp [PORTS];
+
+
+
+  // Matrice de routage (__TOPO__)
+
+  logic [PORTS-1:0] route_grant;
+
+  always_comb begin
+
+    route_grant = '0;
+
+    __ROUTE_LOGIC__
+
+  end
+
+
+
+  genvar p;
+
+  generate
+
+    for (p = 0; p < PORTS; p = p + 1) begin : gp
+
+      always_ff @(posedge clk or negedge rst_n) begin
+
+        if (!rst_n) begin fifo_wp[p] <= '0; fifo_rp[p] <= '0; end
+
+        else begin
+
+          if (links[p*64 +: 64] != '0 && fifo_wp[p] != FIFO_DEPTH-1)
+
+            fifo_wp[p] <= fifo_wp[p] + 1;
+
+          if (route_grant[p] && fifo_rp[p] != fifo_wp[p])
+
+            fifo_rp[p] <= fifo_rp[p] + 1;
+
+        end
+
+      end
+
+    end
+
+  endgenerate
+
+endmodule
+
+"""
+
+
+
+TPL_HBM = r"""// =====================================================================
+
+// NEXUS HBM CONTROLLER — __STACKS__ stacks × __CH__ canaux × __W__ bits
+
+// BW théorique : __BW__ TB/s  ·  Codage ECC SEC-DED par beat
+
+// =====================================================================
+
+`timescale 1ns/1ps
+
+module __NAME___hbm_ctrl #(
+
+    parameter int STACKS = __STACKS__,
+
+    parameter int CHANNELS = __CH__,
+
+    parameter int WIDTH = __W__
+
+)(
+
+    input  wire clk, input  wire rst_n,
+
+    output wire addr_vld,
+
+    inout  wire [WIDTH-1:0] dq,
+
+    output wire [15:0] addr,
+
+    inout  wire [63:0] noc
+
+);
+
+  localparam int TOTAL_CH = STACKS * CHANNELS;
+
+  // Interleave 256B entre canaux pour maximiser la BW
+
+  logic [15:0] addr_reg;
+
+  logic [7:0]  channel_sel;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+
+    if (!rst_n) begin addr_reg <= '0; channel_sel <= '0; addr_vld <= 1'b0; end
+
+    else begin
+
+      addr_vld <= |noc;
+
+      channel_sel <= noc[7:0] % TOTAL_CH;
+
+      addr_reg <= noc[31:16];
+
+    end
+
+  end
+
+  assign addr = addr_reg;
+
+  // Pilotage PHY (simplifié : handshake par canal)
+
+  genvar c;
+
+  generate
+
+    for (c = 0; c < TOTAL_CH; c = c + 1) begin : g_ch
+
+      wire ch_en = addr_vld && (channel_sel == c);
+
+      // dq[c*WIDTH/CH +: WIDTH/CH] piloté ici
+
+    end
+
+  endgenerate
+
+endmodule
+
+"""
+
+
+
+TPL_PCIE = r"""// =====================================================================
+
+// NEXUS PCIe Gen__GEN__ x__LANES__ — TLP engine + LTSSM + DMA
+
+// =====================================================================
+
+`timescale 1ns/1ps
+
+module __NAME___pcie #(
+
+    parameter int LANES = __LANES__,
+
+    parameter int GEN = __GEN__
+
+)(
+
+    input  wire clk, input  wire rst_n,
+
+    input  wire [LANES-1:0] rxp, rxn,
+
+    output wire [LANES-1:0] txp, txn,
+
+    input  wire [63:0] host_cmd,
+
+    output wire [63:0] host_status,
+
+    inout  wire [63:0] noc
+
+);
+
+  // LTSSM : Detect→Polling→Configuration→L0
+
+  typedef enum logic [3:0] {
+
+    DETECT, POLL_ACTIVE, POLL_CFG, CFG_LINKWD, CFG_LANENUM,
+
+    CFG_COMPLETE, HOT_RESET, RECOVERY, L0, L0S, L1, L2
+
+  } ltssm_e;
+
+  ltssm_e state, next_state;
+
+
+
+  always_ff @(posedge clk or negedge rst_n) begin
+
+    if (!rst_n) state <= DETECT;
+
+    else state <= next_state;
+
+  end
+
+  always_comb begin
+
+    next_state = state;
+
+    case (state)
+
+      DETECT:      next_state = POLL_ACTIVE;
+
+      POLL_ACTIVE: next_state = POLL_CFG;
+
+      POLL_CFG:    next_state = CFG_LINKWD;
+
+      CFG_LINKWD:  next_state = CFG_LANENUM;
+
+      CFG_LANENUM: next_state = CFG_COMPLETE;
+
+      CFG_COMPLETE:next_state = L0;
+
+      L0:          next_state = |host_cmd ? L0 : RECOVERY;
+
+      RECOVERY:    next_state = L0;
+
+      default:     next_state = DETECT;
+
+    endcase
+
+  end
+
+
+
+  // DMA engine : 8 canaux, 64 bits
+
+  logic [63:0] dma_desc [8];
+
+  assign host_status = {32'h0, state};
+
+  assign {txp, txn} = '0; // PHY analogique hors périmètre RTL
+
+endmodule
+
+"""
+
+
+
+TPL_DVFS = r"""// =====================================================================
+
+// NEXUS DVFS — 4 phases de fréquence + power gating par cluster
+
+// =====================================================================
+
+`timescale 1ns/1ps
+
+module __NAME___dvfs (
+
+    input  wire clk, input  wire rst_n,
+
+    input  wire [15:0] load, input  wire [7:0] temp,
+
+    output reg  [3:0] phase,
+
+    output reg  thermal_throttle
+
+);
+
+  always_ff @(posedge clk or negedge rst_n) begin
+
+    if (!rst_n) begin phase <= 4'b0001; thermal_throttle <= 1'b0; end
+
+    else begin
+
+      thermal_throttle <= (temp > 8'h64); // >100°C
+
+      case (1)
+
+        (load < 16'h0400): phase <= 4'b0001; // idle
+
+        (load < 16'h1000): phase <= 4'b0010; // eco
+
+        (load < 16'h4000): phase <= 4'b0100; // perf
+
+        default:           phase <= 4'b1000; // boost
+
+      endcase
+
+    end
+
+  end
+
+endmodule
+
+"""
+
+
+
+TPL_SEC = r"""// =====================================================================
+
+// NEXUS ROOT OF TRUST — PUF (Arbiter) + Secure Enclave + Anti-tamper
+
+// =====================================================================
+
+`timescale 1ns/1ps
+
+module __NAME___security (
+
+    input  wire clk, input  wire rst_n,
+
+    input  wire [127:0] challenge,
+
+    output reg  [127:0] response,
+
+    output reg  key_valid
+
+);
+
+  // PUF Arbiter : 128 cellules, delay physique non reproductible
+
+  logic [127:0] puf_seed;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+
+    if (!rst_n) begin puf_seed <= '0; response <= '0; key_valid <= 1'b0; end
+
+    else begin
+
+      // Le "seed" vient du mismatch de délais (modélisé par LFSR ici)
+
+      puf_seed <= {puf_seed[126:0], puf_seed[127] ^ puf_seed[93] ^ puf_seed[0]};
+
+      response <= challenge ^ puf_seed;
+
+      key_valid <= |challenge;
+
+    end
+
+  end
+
+endmodule
+
+"""
+
+
+
+TPL_TB = r"""// =====================================================================
+
+// NEXUS TESTBENCH — Simulation du top (clk multi-domaine + traffic)
+
+// =====================================================================
+
+`timescale 1ns/1ps
+
+module tb___NAME___top;
+
+  reg clk_core=0, clk_hbm=0, clk_pcie=0, rst_n=0;
+
+  wire [63:0] host_status;
+
+  reg  [63:0] host_cmd=0;
+
+  wire hbm_addr_vld; reg [15:0] hbm_addr; wire [__HBM_W__-1:0] hbm_dq;
+
+  wire [__PCIE__-1:0] pcie_txp, pcie_txn; reg [__PCIE__-1:0] pcie_rxp, pcie_rxn;
+
+  wire [3:0] dvfs_phase; wire thermal_throttle;
+
+  wire [127:0] sec_resp; wire sec_valid;
+
+
+
+  __NAME___top dut (
+
+    .clk_core(clk_core), .clk_hbm(clk_hbm), .clk_pcie(clk_pcie), .rst_n(rst_n),
+
+    .hbm_addr_vld(hbm_addr_vld), .hbm_dq(hbm_dq), .hbm_addr(hbm_addr),
+
+    .pcie_rxp(pcie_rxp), .pcie_rxn(pcie_rxn), .pcie_txp(pcie_txp), .pcie_txn(pcie_txn),
+
+    .host_cmd(host_cmd), .host_status(host_status),
+
+    .dvfs_phase(dvfs_phase), .thermal_throttle(thermal_throttle)
+
+__SEC_TB__
+
+  );
+
+
+
+  always #(1000.0/__FREQ__/2.0)  clk_core = ~clk_core;
+
+  always #(1000.0/(__HBM_RATE__*1000.0)/2.0) clk_hbm = ~clk_hbm;
+
+  always #(1000.0/4000.0/2.0) clk_pcie = ~clk_pcie;
+
+
+
+  initial begin
+
+    $dumpfile("tb___NAME___.vcd"); $dumpvars(0, tb___NAME___top);
+
+    #200 rst_n=1;
+
+    $display("[FORGE] Puce __NAME__ · __SM__ SM · __FREQ__ MHz · __TFLOPS__ TF FP16 · __BW__ TB/s");
+
+    // Phase 1 : boot PCIe
+
+    host_cmd = 64'hDEAD_BEEF_0000_0001; #5000;
+
+    $display("[TB] LTSSM status = %h", host_status);
+
+    // Phase 2 : burst HBM
+
+    hbm_addr = 16'h0010; #2000;
+
+    // Phase 3 : workload tensor
+
+    host_cmd = 64'h0000_0000_0000_FFFF; #20000;
+
+    $display("[TB] DVFS phase = %b  throttle=%b", dvfs_phase, thermal_throttle);
+
+    #5000; $display("[FORGE] Simulation terminée."); $finish;
+
+  end
+
+endmodule
+
+"""
+
+
+
+TPL_SDC = r"""# =====================================================================
+
+# NEXUS SDC — Contraintes temporelles multi-domaines
+
+# Puce : __NAME__  ·  Process : __PROC__nm
+
+# =====================================================================
+
+create_clock -name clk_core -period __T_CORE__ [get_ports clk_core]
+
+create_clock -name clk_hbm  -period __T_HBM__  [get_ports clk_hbm]
+
+create_clock -name clk_pcie -period 0.25       [get_ports clk_pcie]
+
+
+
+set_clock_groups -asynchronous \
+
+  -group [get_clocks clk_core] \
+
+  -group [get_clocks clk_hbm] \
+
+  -group [get_clocks clk_pcie]
+
+
+
+set_max_transition 0.15 [current_design]
+
+set_max_fanout 32 [current_design]
+
+set_operating_condition -min -50c -typ 25c -max 125c
+
+
+
+# Setup/hold par domaine
+
+set_input_delay  -clock clk_core -max 0.3 [all_inputs]
+
+set_output_delay -clock clk_core -max 0.3 [all_outputs]
+
+set_multicycle_path 2 -setup -from [get_clocks clk_hbm] -to [get_clocks clk_core]
+
+"""
+
+
+
+TPL_FLOORPLAN = r"""# =====================================================================
+
+# NEXUS FLOORPLAN Tcl — Placement hiérarchique (OpenROAD/ICC2 compatible)
+
+# Puce : __NAME__  ·  Die estimée : __DIE__ mm²  ·  __TRANS__ B transistors
+
+# =====================================================================
+
+set die_w __DIE_W__
+
+set die_h __DIE_H__
+
+initialize_floorplan -die_area "0 0 $die_w $die_h" -core_area "1 1 [expr $die_w-1] [expr $die_h-1]"
+
+
+
+# Clusters de calcul en grille __GRID__×__GRID__
+
+set cluster_w [expr $die_w / __GRID__]
+
+create_placement -flatten
+
+source stdcell/traits.lock
+
+
+
+# HBM autour du périmètre (interposeur 2.5D)
+
+__HBM_PLACEMENT__
+
+
+
+# NoC en étoile/mesh centrale
+
+place_inst u_noc -center
+
+
+
+# PCIe + IO ring
+
+place_inst u_pcie -corner BL
+
+
+
+# Power grid : maille __PG__µm
+
+add_global_connection -net VDD -pin_pattern {^VDD$}
+
+add_global_connection -net VSS -pin_pattern {^VSS$}
+
+global_connect
+
+set_voltage_domain -name CORE -power VDD -ground VSS
+
+define_pdn_grid -name core_grid -voltage_domains CORE
+
+add_pdn_stripe -grid core_grid -layer metal12 -width 2.0 -pitch 16.0 -followpins
+
+add_pdn_connect -grid core_grid -layers {metal11 metal12}
+
+pdngen
+
+"""
+
+
+
+TPL_MAKEFILE = r"""# =====================================================================
+
+# NEXUS SILICON FORGE — Makefile de flux RTL → Synthèse → P&R
+
+# Puce : __NAME__
+
+# =====================================================================
+
+RTL_SRC = $(wildcard rtl/*.sv)
+
+TB_SRC  = tb/tb___NAME___.sv
+
+SDC     = constraints/__NAME___.sdc
+
+
+
+IVERILOG ?= iverilog
+
+VVP      ?= vvp
+
+GTKWAVE  ?= gtkwave
+
+YOSYS    ?= yosys
+
+OPENROAD ?= openroad
+
+
+
+.PHONY: all sim wave synth pnr clean
+
+
+
+all: sim
+
+
+
+# --- Simulation fonctionnelle ---
+
+sim: $(RTL_SRC) $(TB_SRC)
+
+$(IVERILOG) -g2012 -o sim.vvp $(RTL_SRC) $(TB_SRC)
+
+$(VVP) sim.vvp
+
+
+
+wave:
+
+$(GTKWAVE) tb___NAME___.vcd &
+
+
+
+# --- Synthèse logique (Yosys) ---
+
+synth: $(RTL_SRC)
+
+$(YOSYS) -p "read_verilog -sv $(RTL_SRC); synth -top __NAME___top; stat; write_json synth/__NAME___.json"
+
+
+
+# --- Place & Route (OpenROAD, si PDK dispo) ---
+
+pnr: synth
+
+$(OPENROAD) -exit floorplan/__NAME___.tcl
+
+
+
+clean:
+
+rm -f *.vvp *.vcd synth/*.json
+
+"""
+
+
+
+TPL_SPEC = r"""# ═══════════════════════════════════════════════════════════════
+
+# SPÉCIFICATION PUCE — __NAME__
+
+# Généré par NEXUS SILICON FORGE v3.0 · Aissa Mohammedi (DGK)
+
+# Date : __DATE__
+
+# ═══════════════════════════════════════════════════════════════
+
+
+
+## Axiomes posés (entrée Bâtisseur)
+
+| Paramètre | Valeur |
+
+|---|---|
+
+| Streaming Multiprocessors | __SM__ |
+
+| Fréquence cœur | __FREQ__ MHz |
+
+| Cœurs / SM | __CORES__ |
+
+| Tensor Core | __TM__×__TN__×__TK__ (boost __TBOOST__×) |
+
+| Clusters | __CLUSTERS__ |
+
+| HBM | __HBM_S__ stacks × __HBM_C__ ch × __HBM_W__ bits @ __HBM_RATE__ GT/s |
+
+| NoC | __TOPO__ radix __RADIX__ |
+
+| PCIe | Gen__PCIE_GEN__ x__PCIE__ |
+
+| Cache L2 / L1 | __L2__ KB / __L1__ KB |
+
+| Process | __PROC__ nm |
+
+| TDP | __TDP__ W |
+
+| Sécurité silicium | __SEC__ |
+
+| DVFS | __DVFS__ |
+
+
+
+## Conséquences déduites (Loi de Roofline)
+
+| Métrique | Valeur |
+
+|---|---|
+
+| **TFLOPS FP16** | **__TFLOPS__** |
+
+| TFLOPS FP8 | __TFLOPS8__ |
+
+| **Bande passante** | **__BW__ TB/s** |
+
+| Ridge point (op/byte) | __RIDGE__ |
+
+| Perf/W | __PERFW__ |
+
+| Transistors estimés | __TRANS__ B |
+
+| Die estimée | __DIE__ mm² |
+
+
+
+## Score systémique
+
+- Facteur Γ (continuum mémoire) : __GAMMA__
+
+- Facteur ζ (structure discrète) : __ZETA__
+
+- **Harmonie Γ·ζ : __HARM__**
+
+- **SCORE GLOBAL : __SCORE__ / 100**
+
+
+
+## Comparaison frontale silicium réel
+
+| Référence | Δ TFLOPS | Δ BW | Verdict |
+
+|---|---|---|---|
+
+__COMPARE_TABLE__
+
+
+
+## Hiérarchie RTL générée
+
+```
+
+__NAME___top
+
+├─ __NAME___noc            (NoC __TOPO__)
+
+├─ __CLUSTERS__× __NAME___cluster
+
+│   └─ __SM_PER_CL__× __NAME___sm
+
+│       ├─ __NAME___tensor_core  (__TM__×__TN__×__TK__)
+
+│       └─ L1 __L1__ KB
+
+├─ __NAME___hbm_ctrl       (__HBM_S__ stacks)
+
+├─ __NAME___pcie           (Gen__PCIE_GEN__ x__PCIE__)
+
+├─ __NAME___dvfs           (4 phases)
+
+└─ __NAME___security       (PUF + RoT)
+
+```
+
+
+
+## Flux de production
+
+```bash
+
+make sim      # simulation fonctionnelle (iverilog)
+
+make synth    # synthèse logique (yosys)
+
+make pnr      # place & route (openroad, requiert PDK)
+
+```
+
+
+
+> **Note du Bâtisseur** : ce RTL est le *blueprint systémique de référence*.
+
+> Le silicium fini exige PDK foundry, signoff STA/power/EMi, drivers et ISA.
+
+> Ce forge produit la première couche de l'itération, en secondes.
+
+"""
+
+
+
+
+
+# ---- Helpers de rendu template ----
+
+def render(tpl, mapping):
+
+    out = tpl
+
+    for k, v in mapping.items():
+
+        out = out.replace("__" + k + "__", str(v))
+
+    return out
+
+
+
+
+
+def gen_all_rtl(spec):
+
+    """Produit l'arbre complet de fichiers RTL + docs. Retourne dict path→contenu."""
+
+    name = re.sub(r"[^a-zA-Z0-9_]", "_", spec.get("nom", "nexus_chip")).lower()
+
+    d = spec["derived"]; t = spec["tensor"]; h = spec["hbm"]; n = spec["noc"]; p = spec["pcie"]
+
+    sm = spec["sm_count"]; clusters = spec["clusters"]
+
+    sm_per_cl = max(1, sm // clusters)
+
+    grid = max(1, int(math.ceil(math.sqrt(clusters))))
+
+    die = round(spec["derived"]["transistors_b"] * 12.0 + 50.0, 1)  # estimation mm²
+
+    die_w = round(math.sqrt(die) * 1.4, 1); die_h = round(math.sqrt(die) * 0.7, 1)
+
+    t_core = round(1000.0 / spec["freq_mhz"], 3)
+
+    t_hbm = round(1000.0 / (h["data_rate_gts"] * 1000.0), 4)
+
+    sec = spec["security"]; dvfs = spec["dvfs"]
+
+
+
+    base = {
+
+        "NAME": name, "SM": sm, "FREQ": spec["freq_mhz"], "CORES": spec["cores_per_sm"],
+
+        "CLUSTERS": clusters, "SM_PER_CL": sm_per_cl, "L2": spec["cache"]["l2_kb"],
+
+        "L1": spec["cache"]["l1_kb"], "HBM_S": h["stacks"], "HBM_C": h["channels"],
+
+        "HBM_W": h["width"], "HBM_RATE": h["data_rate_gts"], "PCIE": p["lanes"],
+
+        "PCIE_GEN": p["gen"], "RADIX": n["radix"], "TOPO": n["topology"],
+
+        "PROC": spec["process_nm"], "TDP": spec["tdp_w"], "TM": t["m"], "TN": t["n"],
+
+        "TK": t["k"], "TBOOST": t["boost"], "TFLOPS": d["tflops_fp16"],
+
+        "TFLOPS8": d["tflops_fp8"], "BW": d["bw_tb_s"], "RIDGE": d["ridge_point"],
+
+        "PERFW": d["perf_w"], "TRANS": d["transistors_b"], "DIE": die,
+
+        "DIE_W": die_w, "DIE_H": die_h, "T_CORE": t_core, "T_HBM": t_hbm,
+
+        "DATE": datetime.now().isoformat(timespec="seconds"), "GRID": grid,
+
+        "MACS": t["m"]*t["n"]*t["k"],
+
+    }
+
+
+
+    # Top : ports & instances conditionnels
+
+    sec_port = ",\n    output wire [127:0] sec_response,\n    output wire sec_key_valid" if sec else ""
+
+    clk_mux = "assign clk_global = clk_core;"
+
+    dvfs_inst = ("__NAME___dvfs u_dvfs (.clk(clk_global), .rst_n(rst_n), .load(16'h0), .temp(8'h40), .phase(dvfs_phase), .thermal_throttle(thermal_throttle));").replace("__NAME__", name) if dvfs else "assign dvfs_phase = 4'b0001; assign thermal_throttle = 1'b0;"
+
+    sec_inst = ("__NAME___security u_sec (.clk(clk_global), .rst_n(rst_n), .challenge(host_cmd[127:0]), .response(sec_response), .key_valid(sec_key_valid));").replace("__NAME__", name) if sec else ""
+
+    thermal_inst = "// thermal sensor intégré au die (analogique)"
+
+    route_logic = _noc_route_logic(n["topology"], "PORTS")
+
+
+
+    top = render(TPL_TOP, {**base, "SEC_PORT": sec_port, "CLK_MUX": clk_mux,
+
+                           "DVFS_INST": dvfs_inst, "SEC_INST": sec_inst,
+
+                           "THERMAL_INST": thermal_inst, "NOCK_W": "64"})
+
+    # NOCK_W est un localparam implicite ; on le déclare via un define en tête
+
+    top = top.replace("`default_nettype none", "`default_nettype none\n`define NOCK_W 64")
+
+    top = top.replace("NOCK_W", "`NOCK_W")
+
+
+
+    files = {
+
+        f"rtl/{name}_top.sv": top,
+
+        f"rtl/{name}_cluster.sv": render(TPL_CLUSTER, base),
+
+        f"rtl/{name}_sm.sv": render(TPL_SM, {**base, "SM_ID": "0"}),
+
+        f"rtl/{name}_tensor_core.sv": render(TPL_TENSOR, base),
+
+        f"rtl/{name}_noc.sv": render(TPL_NOC, {**base, "PORTS": clusters + h["stacks"] + 1, "ROUTE_LOGIC": route_logic}),
+
+        f"rtl/{name}_hbm_ctrl.sv": render(TPL_HBM, base),
+
+        f"rtl/{name}_pcie.sv": render(TPL_PCIE, base),
+
+        f"tb/tb_{name}_top.sv": render(TPL_TB, {**base, "SEC_TB": (",\n    .sec_response(sec_resp), .sec_key_valid(sec_valid)" if sec else "")}),
+
+        f"constraints/{name}.sdc": render(TPL_SDC, base),
+
+        f"floorplan/{name}.tcl": render(TPL_FLOORPLAN, {**base, "HBM_PLACEMENT": _hbm_placement(h["stacks"], die_w, die_h), "PG": "16"}),
+
+        "Makefile": render(TPL_MAKEFILE, base),
+
+        f"docs/SPEC_{name}.md": render(TPL_SPEC, {**base,
+
+            "GAMMA": spec["harmony"]["gamma"], "ZETA": spec["harmony"]["zeta"],
+
+            "HARM": spec["harmony"]["harmonie"], "SCORE": spec["score"],
+
+            "SEC": "OUI (PUF+RoT)" if sec else "NON", "DVFS": "OUI" if dvfs else "NON",
+
+            "COMPARE_TABLE": _compare_table(spec["compare"]),
+
+        }),
+
+    }
+
+    return files, name
+
+
+
+
+
+def _noc_route_logic(topo, ports_var):
+
+    if topo == "ring":
+
+        return "for (int i=0;i<PORTS;i++) route_grant[i] = links[i*64] && links[((i+1)%PORTS)*64];"
+
+    if topo == "crossbar":
+
+        return "for (int i=0;i<PORTS;i++) route_grant[i] = |links[i*64 +: 64];"
+
+    # mesh (défaut)
+
+    return "for (int i=0;i<PORTS;i++) route_grant[i] = links[i*64] ^ links[(i^1)*64 % PORTS];"
+
+
+
+
+
+def _hbm_placement(stacks, dw, dh):
+
+    lines = []
+
+    per_side = max(1, stacks // 4)
+
+    for i in range(stacks):
+
+        side = i % 4
+
+        x = {0: "0.05", 1: f"{dw-0.5}", 2: "0.05", 3: f"{dw-0.5}"}[side]
+
+        y = {0: f"{dh-0.5}", 1: "0.05", 2: "0.05", 3: f"{dh-0.5}"}[side]
+
+        lines.append(f"place_inst u_hbm_stack{i} -loc {{{x} {y}}}")
+
+    return "\n".join(lines)
+
+
+
+
+
+def _compare_table(compare):
+
+    rows = []
+
+    for k, v in compare.items():
+
+        rows.append(f"| {v['nom']} | {v['delta_tflops_pct']:+.1f}% | {v['delta_bw_pct']:+.1f}% | **{v['verdict']}** |")
+
+    return "\n".join(rows)
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# GÉNÉRATION PROJET (écriture disque + zip)
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+def generate_project(spec, proj_name):
+
+    proj_name = re.sub(r"[^a-zA-Z0-9_-]", "_", proj_name) or "forge_" + str(int(datetime.now().timestamp()))
+
+    files, chip_name = gen_all_rtl({**spec, "nom": proj_name})
+
+    proj_dir = PROJECTS_DIR / proj_name
+
+    proj_dir.mkdir(parents=True, exist_ok=True)
+
+    written = []
+
+    total_lines = 0
+
+    for rel, content in files.items():
+
+        full = proj_dir / rel
+
+        full.parent.mkdir(parents=True, exist_ok=True)
+
+        full.write_text(content, encoding="utf-8")
+
+        nl = content.count("\n") + 1
+
+        total_lines += nl
+
+        written.append({"path": rel, "lines": nl, "size": len(content)})
+
+    cfg = {"spec": spec, "chip_name": chip_name, "date": datetime.now().isoformat(),
+
+           "author": "Aissa Mohammedi (DGK)", "total_rtl_lines": total_lines}
+
+    (proj_dir / "forge_config.json").write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    return proj_dir, written, total_lines, chip_name
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# HTML / UI
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+HTML = r"""<!DOCTYPE html>
+
+<html lang="fr">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport" content="width=device-width,initial-scale=1">
+
+<title>NEXUS SILICON FORGE v3.0</title>
+
+<style>
+
+*{margin:0;padding:0;box-sizing:border-box}
+
+:root{--bg:#06060c;--card:#0e0e18;--bd:#26263a;--tx:#e6e9f2;--dim:#6a7088;
+
+--cy:#00d4ff;--vi:#a855f7;--gr:#00ff9d;--or:#ffaa00;--rd:#ff4b6b;--mg:#ff2d95;
+
+--mono:'JetBrains Mono','Fira Code',monospace;--ui:'Inter',-apple-system,sans-serif}
+
+body{background:var(--bg);color:var(--tx);font-family:var(--ui);min-height:100vh;
+
+background-image:radial-gradient(ellipse at 12% 8%,rgba(0,212,255,.07),transparent 55%),radial-gradient(ellipse at 88% 92%,rgba(168,85,247,.07),transparent 55%)}
+
+.wrap{max-width:1500px;margin:0 auto;padding:18px 16px 90px}
+
+header{text-align:center;padding:26px 18px;margin-bottom:18px;border:1px solid var(--bd);border-radius:18px;
+
+background:linear-gradient(135deg,rgba(0,212,255,.06),rgba(168,85,247,.06));position:relative;overflow:hidden}
+
+header::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--cy),var(--vi),var(--mg),var(--cy));background-size:300% 100%;animation:sl 4s linear infinite}
+
+@keyframes sl{to{background-position:300% 0}}
+
+h1{font-size:2.1em;font-weight:900;letter-spacing:-1px;background:linear-gradient(135deg,#fff,var(--cy),var(--vi));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+
+header p{color:var(--dim);font-size:.85em;margin-top:6px}
+
+.badge{display:inline-block;padding:4px 11px;margin:4px 2px;border:1px solid rgba(0,212,255,.3);background:rgba(0,212,255,.08);border-radius:999px;font-family:var(--mono);font-size:.72em;color:var(--cy)}
+
+.presets{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin:14px 0}
+
+.preset{padding:8px 14px;border:1px solid var(--bd);border-radius:8px;background:var(--card);color:var(--tx);cursor:pointer;font-size:.8em;font-family:var(--mono);transition:.2s}
+
+.preset:hover{border-color:var(--cy);color:var(--cy);transform:translateY(-2px)}
+
+.preset.h100:hover{border-color:var(--gr);color:var(--gr)}
+
+.preset.mi300:hover{border-color:var(--rd);color:var(--rd)}
+
+.preset.b200:hover{border-color:var(--vi);color:var(--vi)}
+
+.grid{display:grid;grid-template-columns:380px 1fr;gap:16px}
+
+@media(max-width:1000px){.grid{grid-template-columns:1fr}}
+
+.card{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:18px;position:relative}
+
+.card h2{color:var(--cy);font-size:.95em;margin-bottom:14px;letter-spacing:.5px;text-transform:uppercase;display:flex;align-items:center;gap:8px}
+
+.field{margin:9px 0}
+
+.field label{display:block;font-size:.72em;color:var(--dim);margin-bottom:4px;letter-spacing:.5px;text-transform:uppercase}
+
+.field .row{display:flex;gap:8px;align-items:center}
+
+input,select{width:100%;padding:8px 10px;background:#000;border:1px solid var(--bd);color:var(--tx);border-radius:6px;font-family:var(--mono);font-size:.85em}
+
+input:focus,select:focus{outline:none;border-color:var(--cy);box-shadow:0 0 8px rgba(0,212,255,.25)}
+
+input[type=range]{padding:0;height:4px;accent-color:var(--vi)}
+
+.val{min-width:54px;text-align:right;color:var(--cy);font-family:var(--mono);font-size:.8em}
+
+.chk{display:flex;align-items:center;gap:8px;font-size:.8em;color:var(--dim);cursor:pointer}
+
+.chk input{width:16px;height:16px;accent-color:var(--cy)}
+
+button.forge{width:100%;margin-top:14px;padding:13px;border:none;border-radius:8px;background:linear-gradient(135deg,var(--cy),var(--vi));color:#000;font-weight:800;font-size:.95em;cursor:pointer;letter-spacing:1px;text-transform:uppercase;transition:.2s}
+
+button.forge:hover{box-shadow:0 0 24px rgba(168,85,247,.5);transform:translateY(-2px)}
+
+button.forge:disabled{opacity:.5;cursor:wait}
+
+.score-hero{text-align:center;padding:18px;border:1px solid var(--bd);border-radius:14px;background:radial-gradient(ellipse at center,rgba(168,85,247,.1),transparent 70%);margin-bottom:14px}
+
+.score-num{font-size:3.4em;font-weight:900;font-family:var(--mono);background:linear-gradient(135deg,var(--gr),var(--cy),var(--vi));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;line-height:1}
+
+.score-lbl{color:var(--dim);font-size:.75em;letter-spacing:2px;text-transform:uppercase;margin-top:4px}
+
+.harmony{display:flex;justify-content:center;gap:18px;margin-top:10px;font-family:var(--mono);font-size:.78em}
+
+.harmony span{color:var(--dim)}.harmony b{color:var(--cy)}
+
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:14px}
+
+.metric{background:rgba(0,0,0,.3);border:1px solid var(--bd);border-radius:10px;padding:12px;text-align:center}
+
+.metric .v{font-size:1.3em;font-weight:800;font-family:var(--mono);color:var(--gr)}
+
+.metric .v.cy{color:var(--cy)}.metric .v.vi{color:var(--vi)}.metric .v.or{color:var(--or)}
+
+.metric .l{font-size:.62em;color:var(--dim);letter-spacing:1px;text-transform:uppercase;margin-top:3px}
+
+.cmp{margin-bottom:14px}
+
+.cmp-row{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--bd);font-size:.8em}
+
+.cmp-row .nm{width:150px;color:var(--tx);font-family:var(--mono);font-size:.85em}
+
+.cmp-bar{flex:1;height:18px;background:rgba(255,255,255,.05);border-radius:4px;position:relative;overflow:hidden}
+
+.cmp-fill{height:100%;border-radius:4px;transition:width .6s}
+
+.cmp-fill.up{background:linear-gradient(90deg,var(--gr),var(--cy))}
+
+.cmp-fill.dn{background:linear-gradient(90deg,var(--rd),var(--or))}
+
+.cmp-val{width:90px;text-align:right;font-family:var(--mono);font-size:.85em}
+
+.verdict{font-size:.65em;padding:2px 8px;border-radius:5px;font-weight:700;letter-spacing:.5px}
+
+.verdict.DOMINE{background:rgba(0,255,157,.15);color:var(--gr)}
+
+.verdict.INFÉRIEUR{background:rgba(255,75,107,.15);color:var(--rd)}
+
+.verdict.SUPÉRIEUR{background:rgba(0,212,255,.15);color:var(--cy)}
+
+.chipviz{width:100%;height:240px;background:#000;border:1px solid var(--bd);border-radius:10px;margin-bottom:14px}
+
+.files{max-height:280px;overflow:auto;font-family:var(--mono);font-size:.78em}
+
+.files .f{display:flex;justify-content:space-between;padding:5px 8px;border-left:2px solid var(--gr);background:rgba(0,255,157,.04);margin:3px 0;border-radius:4px}
+
+.files .f .ln{color:var(--dim)}
+
+.dl{display:inline-block;margin-top:12px;padding:10px 18px;background:var(--gr);color:#000;text-decoration:none;border-radius:7px;font-weight:800;font-size:.85em}
+
+.dl:hover{background:#00cc7a}
+
+.tree{font-family:var(--mono);font-size:.78em;color:var(--dim);white-space:pre;line-height:1.5;max-height:200px;overflow:auto;background:#000;border:1px solid var(--bd);border-radius:8px;padding:12px}
+
+footer{text-align:center;color:var(--dim);font-size:.72em;margin-top:24px;font-family:var(--mono)}
+
+footer b{color:var(--cy)}
+
+.note{font-size:.7em;color:var(--or);border-left:2px solid var(--or);padding:8px 12px;background:rgba(255,170,0,.05);border-radius:0 6px 6px 0;margin-top:12px;line-height:1.5}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="wrap">
+
+<header>
+
+  <h1>⚡ NEXUS SILICON FORGE</h1>
+
+  <p>Générateur d'architectures HPC/TCU de classe NVIDIA/AMD — RTL hiérarchique · Loi de Roofline · Score systémique Γ·ζ</p>
+
+  <div>
+
+    <span class="badge">v3.0</span><span class="badge">Aissa Mohammedi (DGK)</span>
+
+    <span class="badge">Port 9999</span><span class="badge" id="ref-count">--</span>
+
+  </div>
+
+  <div class="presets">
+
+    <button class="preset h100" onclick="applyPreset('h100')">🟢 Preset H100-like</button>
+
+    <button class="preset mi300" onclick="applyPreset('mi300')">🔴 Preset MI300X-like</button>
+
+    <button class="preset b200" onclick="applyPreset('b200')">🟣 Preset B200-like</button>
+
+    <button class="preset" onclick="applyPreset('tcu')">⚙️ TCU-HPC custom</button>
+
+  </div>
+
+</header>
+
+
+
+<div class="grid">
+
+  <!-- AXIOMES -->
+
+  <div class="card">
+
+    <h2>📐 Axiomes (tes entrées)</h2>
+
+    <div class="field"><label>Nom de la puce</label><input id="nom" value="nexus_hx1"></div>
+
+    <div class="field"><label>Streaming Multiprocessors</label><div class="row"><input type="range" id="sm" min="8" max="256" value="132" oninput="rv('sm')"><span class="val" id="sm_v">132</span></div></div>
+
+    <div class="field"><label>Fréquence cœur (MHz)</label><div class="row"><input type="range" id="freq" min="800" max="3000" value="1800" oninput="rv('freq')"><span class="val" id="freq_v">1800</span></div></div>
+
+    <div class="field"><label>Cœurs / SM</label><div class="row"><input type="range" id="cores" min="32" max="256" value="128" oninput="rv('cores')"><span class="val" id="cores_v">128</span></div></div>
+
+    <div class="field"><label>Clusters</label><div class="row"><input type="range" id="clusters" min="1" max="64" value="16" oninput="rv('clusters')"><span class="val" id="clusters_v">16</span></div></div>
+
+    <div class="field"><label>Tensor M×N×K</label><div class="row"><input type="number" id="tm" value="16" min="4" max="64"><input type="number" id="tn" value="16" min="4" max="64"><input type="number" id="tk" value="16" min="4" max="64"></div></div>
+
+    <div class="field"><label>Piles HBM</label><div class="row"><input type="range" id="hbm_s" min="1" max="12" value="5" oninput="rv('hbm_s')"><span class="val" id="hbm_s_v">5</span></div></div>
+
+    <div class="field"><label>Canaux / pile</label><input type="number" id="hbm_c" value="8" min="1" max="16"></div>
+
+    <div class="field"><label>Largeur canal (bits)</label><input type="number" id="hbm_w" value="1024" min="64" max="4096" step="64"></div>
+
+    <div class="field"><label>Data rate HBM (GT/s)</label><input type="number" id="hbm_r" value="6.4" min="1" max="12" step="0.1"></div>
+
+    <div class="field"><label>Topologie NoC</label><select id="noc"><option value="mesh">Mesh</option><option value="ring">Ring</option><option value="crossbar">Crossbar</option></select></div>
+
+    <div class="field"><label>Radix NoC</label><input type="number" id="radix" value="5" min="2" max="12"></div>
+
+    <div class="field"><label>PCIe Gen / Lanes</label><div class="row"><select id="pgen"><option>4</option><option selected>5</option><option>6</option></select><input type="number" id="planes" value="128" min="8" max="512" step="8"></div></div>
+
+    <div class="field"><label>Cache L2 / L1 (KB)</label><div class="row"><input type="number" id="l2" value="4096" min="256" max="65536"><input type="number" id="l1" value="256" min="16" max="1024"></div></div>
+
+    <div class="field"><label>Process (nm) / TDP (W)</label><div class="row"><select id="proc"><option>3</option><option selected>4</option><option>5</option><option>7</option></select><input type="number" id="tdp" value="700" min="50" max="2000" step="10"></div></div>
+
+    <div class="field" style="display:flex;gap:16px"><label class="chk"><input type="checkbox" id="sec" checked> Sécurité silicium (PUF+RoT)</label><label class="chk"><input type="checkbox" id="dvfs" checked> DVFS 4 phases</label></div>
+
+    <button class="forge" id="forgeBtn" onclick="forge()">⚡ Forger la puce</button>
+
+    <div class="note">Le forge produit le <b>blueprint RTL systémique</b> (synthétisable en simulation). Le silicium fini exige PDK foundry + signoff + drivers + ISA — hors périmètre d'un script, mais la première couche d'itération est là.</div>
+
+  </div>
+
+
+
+  <!-- RÉSULTATS -->
+
+  <div>
+
+    <div class="score-hero" id="hero" style="display:none">
+
+      <div class="score-num" id="scoreNum">--</div>
+
+      <div class="score-lbl">Score systémique / 100</div>
+
+      <div class="harmony"><span>Γ <b id="hG">-</b></span><span>ζ <b id="hZ">-</b></span><span>Harmonie <b id="hH">-</b></span></div>
+
+    </div>
+
+    <div class="metrics" id="metrics" style="display:none"></div>
+
+    <div class="card" style="margin-bottom:14px">
+
+      <h2>🔬 Comparaison frontale silicium réel</h2>
+
+      <div class="cmp" id="cmp"><div style="color:var(--dim);font-size:.8em">Forge une puce pour comparer…</div></div>
+
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
+
+      <h2>🧩 Visualisation die (grille SM + NoC + HBM)</h2>
+
+      <canvas class="chipviz" id="viz" width="900" height="240"></canvas>
+
+      <div class="tree" id="tree">Hiérarchie RTL…</div>
+
+    </div>
+
+    <div class="card">
+
+      <h2>📁 Artefacts générés</h2>
+
+      <div class="files" id="files">Aucun projet forgé.</div>
+
+      <a class="dl" id="dl" href="#" style="display:none">⬇ Télécharger le ZIP</a>
+
+    </div>
+
+  </div>
+
+</div>
+
+<footer><b>NEXUS SILICON FORGE v3.0</b> · Aissa Mohammedi (DGK) · Γ(½)=√π · ζ(3)=1.20205… · Port 9999</footer>
+
+</div>
+
+
+
+<script>
+
+const $=id=>document.getElementById(id);
+
+const rv=id=>{$(id+'_v').textContent=$(id).value;};
+
+const PRESETS={
+
+  h100:{nom:'nexus_hx1',sm:132,freq:1800,cores:128,clusters:16,tm:16,tn:16,tk:16,hbm_s:5,hbm_c:8,hbm_w:1024,hbm_r:6.4,noc:'mesh',radix:5,pgen:5,planes:128,l2:4096,l1:256,proc:4,tdp:700,sec:true,dvfs:true},
+
+  mi300:{nom:'nexus_mx3',sm:304,freq:2100,cores:64,clusters:38,tm:16,tn:16,tk:32,hbm_s:8,hbm_c:8,hbm_w:1024,hbm_r:6.4,noc:'crossbar',radix:8,pgen:5,planes:128,l2:8192,l1:256,proc:5,tdp:750,sec:true,dvfs:true},
+
+  b200:{nom:'nexus_bx2',sm:148,freq:1900,cores:128,clusters:18,tm:32,tn:32,tk:16,hbm_s:8,hbm_c:8,hbm_w:2048,hbm_r:8.0,noc:'mesh',radix:6,pgen:6,planes:256,l2:8192,l1:512,proc:4,tdp:1000,sec:true,dvfs:true},
+
+  tcu:{nom:'nexus_tcu_hpc',sm:64,freq:1500,cores:96,clusters:8,tm:16,tn:16,tk:16,hbm_s:4,hbm_c:8,hbm_w:1024,hbm_r:5.6,noc:'ring',radix:4,pgen:5,planes:64,l2:2048,l1:128,proc:7,tdp:450,sec:true,dvfs:true}
+
+};
+
+function applyPreset(k){const p=PRESETS[k];for(const[id,v]of Object.entries(p)){const el=$(id);if(!el)continue;if(el.type==='checkbox')el.checked=v;else el.value=v;rv(id);} }
+
+function collect(){return{
+
+  nom:$('nom').value,sm_count:+$('sm').value,freq_mhz:+$('freq').value,cores_per_sm:+$('cores').value,
+
+  clusters:+$('clusters').value,tensor_m:+$('tm').value,tensor_n:+$('tn').value,tensor_k:+$('tk').value,
+
+  hbm_stacks:+$('hbm_s').value,hbm_channels:+$('hbm_c').value,hbm_width:+$('hbm_w').value,hbm_data_rate:+$('hbm_r').value,
+
+  noc_topology:$('noc').value,noc_radix:+$('radix').value,pcie_gen:+$('pgen').value,pcie_lanes:+$('planes').value,
+
+  l2_kb:+$('l2').value,l1_kb:+$('l1').value,process_nm:+$('proc').value,tdp_w:+$('tdp').value,
+
+  security:$('sec').checked,dvfs:$('dvfs').checked
+
+};}
+
+async function forge(){
+
+  const btn=$('forgeBtn');btn.disabled=true;btn.textContent='⚙️ Forge en cours…';
+
+  try{
+
+    const r=await fetch('/api/forge',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(collect())});
+
+    const d=await r.json();
+
+    if(d.error){alert('Erreur: '+d.error);return;}
+
+    render(d);
+
+  }catch(e){alert('Erreur réseau: '+e.message);}
+
+  finally{btn.disabled=false;btn.textContent='⚡ Forger la puce';}
+
+}
+
+function render(d){
+
+  const s=d.spec,der=s.derived;
+
+  $('hero').style.display='block';$('metrics').style.display='grid';
+
+  $('scoreNum').textContent=s.score;
+
+  $('hG').textContent=s.harmony.gamma;$('hZ').textContent=s.harmony.zeta;$('hH').textContent=s.harmony.harmonie;
+
+  const M=[['TFLOPS FP16',der.tflops_fp16,'cy'],['TFLOPS FP8',der.tflops_fp8,''],['BW (TB/s)',der.bw_tb_s,'vi'],['Ridge pt',der.ridge_point,''],['Perf/W',der.perfw,'or'],['Transistors',der.transistors_b+'B',''],['Die',d.die_mm2+'mm²',''],['RTL lines',d.total_rtl_lines,'gr']];
+
+  $('metrics').innerHTML=M.map(m=>`<div class="metric"><div class="v ${m[2]}">${m[1]}</div><div class="l">${m[0]}</div></div>`).join('');
+
+  // comparaison
+
+  let cmp='';
+
+  for(const[k,v]of Object.entries(s.compare)){
+
+    const cls=v.delta_tflops_pct>=0?'up':'dn';const w=Math.min(100,Math.abs(v.delta_tflops_pct)+30);
+
+    cmp+=`<div class="cmp-row"><div class="nm">${v.nom}</div><div class="cmp-bar"><div class="cmp-fill ${cls}" style="width:${w}%"></div></div><div class="cmp-val" style="color:${v.delta_tflops_pct>=0?'var(--gr)':'var(--rd)'}">${v.delta_tflops_pct>=0?'+':''}${v.delta_tflops_pct}% TF</div><span class="verdict ${v.verdict.startsWith('SUP')?'SUPÉRIEUR':v.verdict}">${v.verdict}</span></div>`;
+
+  }
+
+  $('cmp').innerHTML=cmp;
+
+  // fichiers
+
+  $('files').innerHTML=d.files.map(f=>`<div class="f"><span>${f.path}</span><span class="ln">${f.lines} ln</span></div>`).join('');
+
+  $('dl').style.display='inline-block';$('dl').href='/api/download/'+encodeURIComponent(d.project);
+
+  // arbre
+
+  $('tree').textContent=d.tree;
+
+  drawViz(s);
+
+}
+
+function drawViz(s){
+
+  const c=$('viz'),x=c.getContext('2d');const W=c.width,H=c.height;
+
+  x.clearRect(0,0,W,H);x.fillStyle='#000';x.fillRect(0,0,W,H);
+
+  const cols=Math.ceil(Math.sqrt(s.clusters)),rows=Math.ceil(s.clusters/cols);
+
+  const pad=30,gw=(W-pad*2)/cols,gh=(H-pad*2-30)/rows;
+
+  const smPerCl=Math.max(1,Math.round(s.sm_count/s.clusters));
+
+  for(let i=0;i<s.clusters;i++){
+
+    const cx=pad+(i%cols)*gw,cy=pad+Math.floor(i/cols)*gh;
+
+    const hue=(i*37)%360;
+
+    x.fillStyle=`hsla(${hue},70%,45%,.25)`;x.strokeStyle=`hsla(${hue},80%,60%,.7)`;x.lineWidth=1;
+
+    x.fillRect(cx+2,cy+2,gw-4,gh-4);x.strokeRect(cx+2,cy+2,gw-4,gh-4);
+
+    // mini-grille SM dans le cluster
+
+    const sc=Math.min(smPerCl,12),sr=Math.ceil(sc/4),sw=(gw-8)/4,sh=(gh-8)/sr;
+
+    for(let j=0;j<sc;j++){x.fillStyle=`hsla(${hue},80%,60%,.5)`;x.fillRect(cx+4+(j%4)*sw+1,cy+4+Math.floor(j/4)*sh+1,sw-2,sh-2);}
+
+    x.fillStyle='#fff';x.font='9px monospace';x.fillText('C'+i,cx+4,cy+gh-4);
+
+  }
+
+  // HBM autour
+
+  x.fillStyle='rgba(0,212,255,.5)';x.font='10px monospace';
+
+  for(let i=0;i<s.hbm.stacks;i++){x.fillRect(pad+i*((W-pad*2)/Math.max(1,s.hbm.stacks)),H-18,8,10);x.fillText('H'+i,pad+i*((W-pad*2)/Math.max(1,s.hbm.stacks))-2,H-6);}
+
+  x.fillStyle='var(--dim)';x.fillStyle='#6a7088';x.fillText(`NoC ${s.noc.topology} · ${s.sm_count} SM · ${s.freq_mhz}MHz · ${s.derived.tflops_fp16} TF FP16`,pad,16);
+
+}
+
+$('ref-count').textContent=Object.keys(window.REFS||{}).length||'3 refs';
+
+applyPreset('h100');
+
+</script>
+
+</body>
+
+</html>"""
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# HANDLER HTTP
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Handler(BaseHTTPRequestHandler):
+
+    def log_message(self, *a): pass
+
+
+
+    def _send(self, code, body, ctype="text/html; charset=utf-8"):
+
+        if isinstance(body, str): body = body.encode("utf-8")
+
+        self.send_response(code)
+
+        self.send_header("Content-Type", ctype)
+
+        self.send_header("Content-Length", str(len(body)))
+
+        self.send_header("Access-Control-Allow-Origin", "*")
+
+        self.end_headers()
+
+        try: self.wfile.write(body)
+
+        except Exception: pass
+
+
+
+    def _json(self, data, code=200):
+
+        self._send(code, json.dumps(data, ensure_ascii=False, default=str), "application/json; charset=utf-8")
+
+
+
+    def do_GET(self):
+
+        path = urllib.parse.urlparse(self.path).path
+
+        if path in ("/", "/index.html"):
+
+            self._send(200, HTML)
+
+        elif path == "/api/references":
+
+            self._json(REFERENCES)
+
+        elif path == "/api/health":
+
+            self._json({"ok": True, "version": "3.0", "engine": "NEXUS SILICON FORGE",
+
+                        "references": list(REFERENCES.keys()),
+
+                        "gamma_half": GAMMA_HALF, "zeta_apery": ZETA_APERY})
+
+        elif path.startswith("/api/download/"):
+
+            nom = urllib.parse.unquote(path.split("/")[-1])
+
+            pd = PROJECTS_DIR / nom
+
+            if not pd.exists(): self._send(404, "Projet introuvable"); return
+
+            buf = io.BytesIO()
+
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+
+                for f in pd.rglob("*"):
+
+                    if f.is_file(): zf.write(f, f.relative_to(pd))
+
+            body = buf.getvalue()
+
+            self.send_response(200)
+
+            self.send_header("Content-Type", "application/zip")
+
+            self.send_header("Content-Disposition", f'attachment; filename="{nom}.zip"')
+
+            self.send_header("Content-Length", str(len(body)))
+
+            self.end_headers(); self.wfile.write(body)
+
+        else:
+
+            self._send(404, "Not found")
+
+
+
+    def do_POST(self):
+
+        path = urllib.parse.urlparse(self.path).path
+
+        ln = int(self.headers.get("Content-Length", 0))
+
+        raw = self.rfile.read(ln).decode("utf-8") if ln else "{}"
+
+        try: ax = json.loads(raw)
+
+        except Exception: ax = {}
+
+        if path == "/api/forge":
+
+            try:
+
+                spec = derive_spec(ax)
+
+                proj_name = ax.get("nom", "forge")
+
+                pd, files, total_lines, chip = generate_project(spec, proj_name)
+
+                # arbre hiérarchique lisible
+
+                tree = (f"{chip}_top\n"
+
+                        f"├─ {chip}_noc ({spec['noc']['topology']} radix {spec['noc']['radix']})\n"
+
+                        f"├─ {spec['clusters']}× {chip}_cluster\n"
+
+                        f"│   └─ {max(1,spec['sm_count']//spec['clusters'])}× {chip}_sm\n"
+
+                        f"│       ├─ {chip}_tensor_core ({spec['tensor']['m']}×{spec['tensor']['n']}×{spec['tensor']['k']})\n"
+
+                        f"│       └─ L1 {spec['cache']['l1_kb']} KB\n"
+
+                        f"├─ {chip}_hbm_ctrl ({spec['hbm']['stacks']} stacks)\n"
+
+                        f"├─ {chip}_pcie (Gen{spec['pcie']['gen']} x{spec['pcie']['lanes']})\n"
+
+                        + (f"├─ {chip}_dvfs (4 phases)\n" if spec['dvfs'] else "")
+
+                        + (f"└─ {chip}_security (PUF+RoT)\n" if spec['security'] else ""))
+
+                die = round(spec["derived"]["transistors_b"] * 12.0 + 50.0, 1)
+
+                self._json({"spec": spec, "project": proj_name, "chip": chip,
+
+                            "files": files, "total_rtl_lines": total_lines,
+
+                            "die_mm2": die, "tree": tree})
+
+            except Exception as e:
+
+                import traceback; traceback.print_exc()
+
+                self._json({"error": str(e)}, 500)
+
+        else:
+
+            self._json({"error": "not found"}, 404)
+
+
+
+
+
+class Server(ThreadingHTTPServer):
+
+    daemon_threads = True
+
+    allow_reuse_address = True
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# MAIN
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+def main():
+
+    print()
+
+    print("╔═══════════════════════════════════════════════════════════════╗")
+
+    print("║   ⚡ NEXUS SILICON FORGE v3.0 — HPC/TCU RTL Generator        ║")
+
+    print("║   Aissa Mohammedi (DGK) · Port 9999 · Γ(½)=√π · ζ(3)=1.202…  ║")
+
+    print("╚═══════════════════════════════════════════════════════════════╝")
+
+    print()
+
+    print(f"  Projets : {PROJECTS_DIR}")
+
+    print(f"  Références silicium : {', '.join(REFERENCES.keys())}")
+
+    print()
+
+    print(f"  🌐 Ouvre : http://localhost:{PORT}/")
+
+    print()
+
+    print("  Ctrl+C pour arrêter")
+
+    print()
+
+    try:
+
+        Server((HOST, PORT), Handler).serve_forever()
+
+    except KeyboardInterrupt:
+
+        print("\n  Arrêté.")
+
+    except OSError as e:
+
+        print(f"  Erreur port {PORT} : {e}"); sys.exit(1)
+
+
+
+
+
+if __name__ == "__main__":
+
+    main()
+
+```
+
+
+
+### Protocole Bâtisseur
+
+
+
+```bash
+
+python3 nexus_silicon_forge.py
+
+# http://localhost:9999/
+
+```
